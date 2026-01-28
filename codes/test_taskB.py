@@ -66,7 +66,6 @@ def build_oracle_timefeat_from_npz(npz: np.lib.npyio.NpzFile, t: int) -> tuple[t
     return tfeat, tvalid
 
 
-
 @dataclass(frozen=True)
 class SampleB:
     vid: str
@@ -76,10 +75,17 @@ class SampleB:
     phase_id: int
 
 
-def load_timepreds(timepred_root: Path, split_json: Path, split: str) -> dict[str, torch.Tensor]:
+# -------------------------
+# Load timepreds (pred + valid)
+# -------------------------
+def load_timepreds(timepred_root: Path, split_json: Path, split: str) -> dict[str, dict[str, torch.Tensor]]:
     """
     Load time predictions from:
       timepred_root/{split}/{vid}.pt
+
+    Supports:
+      - dict with {"pred": Tensor(T,F), "valid": BoolTensor(T,)}
+      - Tensor(T,F)  (then valid is all True)
     """
     split_map = json.loads(Path(split_json).read_text())
     vids = split_map[split]
@@ -88,22 +94,30 @@ def load_timepreds(timepred_root: Path, split_json: Path, split: str) -> dict[st
     if not split_dir.exists():
         raise FileNotFoundError(f"Missing split dir: {split_dir}")
 
-    out: dict[str, torch.Tensor] = {}
+    out: dict[str, dict[str, torch.Tensor]] = {}
     for vid in vids:
         p = split_dir / f"{vid}.pt"
         if not p.exists():
             raise FileNotFoundError(f"Missing timepred file: {p}")
+
         obj = torch.load(p, map_location="cpu")
-        if torch.is_tensor(obj):
-            t = obj
-        elif isinstance(obj, dict) and "pred" in obj:
-            t = obj["pred"]
+
+        if isinstance(obj, dict) and "pred" in obj and "valid" in obj:
+            pred = obj["pred"].to(dtype=torch.float32)
+            valid = obj["valid"].to(dtype=torch.bool)
+        elif torch.is_tensor(obj):
+            pred = obj.to(dtype=torch.float32)
+            valid = torch.ones((pred.shape[0],), dtype=torch.bool)
         else:
-            raise RuntimeError(f"{p} did not contain a Tensor or dict with 'pred'")
-        out[vid] = t.to(dtype=torch.float32)
+            raise RuntimeError(f"{p} must be Tensor or dict(pred, valid)")
+
+        out[vid] = {"pred": pred, "valid": valid}
     return out
 
 
+# -------------------------
+# Dataset: predicted time
+# -------------------------
 class Cholec80ToolDatasetWithTimePred(Dataset):
     def __init__(
         self,
@@ -111,7 +125,7 @@ class Cholec80ToolDatasetWithTimePred(Dataset):
         labels_dir: Path,
         split_json: Path,
         split: str,
-        timepreds: dict[str, torch.Tensor],
+        timepreds: dict[str, dict[str, torch.Tensor]],
         stride: int = 1,
         transform=None,
     ):
@@ -138,8 +152,8 @@ class Cholec80ToolDatasetWithTimePred(Dataset):
                 raise RuntimeError(f"{vid}: frames={len(frames)} != T_1fps={T}")
             if vid not in self.timepreds:
                 raise RuntimeError(f"Missing timepreds for {vid}")
-            if int(self.timepreds[vid].shape[0]) != T:
-                raise RuntimeError(f"{vid}: timepred_len={self.timepreds[vid].shape[0]} != T_1fps={T}")
+            if int(self.timepreds[vid]["pred"].shape[0]) != T:
+                raise RuntimeError(f"{vid}: timepred_len={self.timepreds[vid]['pred'].shape[0]} != T_1fps={T}")
 
             for t in range(0, T, stride):
                 self.samples.append(
@@ -160,12 +174,95 @@ class Cholec80ToolDatasetWithTimePred(Dataset):
         img = Image.open(s.img_path).convert("RGB")
         if self.transform is not None:
             img = self.transform(img)
+
         y = torch.from_numpy(s.y)
         phase_id = torch.tensor(s.phase_id)
-        tfeat = self.timepreds[s.vid][s.t].to(dtype=torch.float32)
-        return img, y, phase_id, tfeat
+
+        tp = self.timepreds[s.vid]
+        tfeat = tp["pred"][s.t].to(dtype=torch.float32)   # (F,)
+        tvalid = tp["valid"][s.t]                         # bool scalar
+        t_idx = torch.tensor(float(s.t), dtype=torch.float32)
+
+        return img, y, phase_id, tfeat, t_idx, tvalid
 
 
+# -------------------------
+# Dataset: oracle time (GT)
+# -------------------------
+class Cholec80ToolDatasetWithOracleTime(Dataset):
+    def __init__(
+        self,
+        cholec80_dir: Path,
+        labels_dir: Path,
+        split_json: Path,
+        split: str,
+        stride: int = 1,
+        transform=None,
+    ):
+        super().__init__()
+        assert split in {"train", "val", "test"}
+        self.transform = transform
+        self.samples: list[SampleB] = []
+        self.labels_dir = Path(labels_dir)
+
+        split_map = json.loads(Path(split_json).read_text())
+        videos = split_map[split]
+
+        # 안정성: npz 객체를 들고 있지 말고 path만 저장
+        self.npz_path_map: dict[str, Path] = {}
+
+        for vid in videos:
+            frames_dir = Path(cholec80_dir) / "frames" / vid
+            npz_path = self.labels_dir / f"{vid}_labels.npz"
+            frames = sorted(frames_dir.glob("*.png"))
+            data = np.load(npz_path, allow_pickle=False)
+
+            T = int(data["T_1fps"][0])
+            if len(frames) != T:
+                raise RuntimeError(f"{vid}: frames={len(frames)} != T_1fps={T}")
+
+            for k in ["rt_current", "bounds_rem"]:
+                if k not in data.files:
+                    raise RuntimeError(f"{vid}: missing '{k}' in labels npz (needed for oracle time)")
+
+            tools = data["tools_1fps"].astype(np.float32)
+            phase_ids = data["phase_ids_1fps"].astype(np.int64)
+
+            self.npz_path_map[vid] = npz_path
+
+            for t in range(0, T, stride):
+                self.samples.append(
+                    SampleB(
+                        vid=vid,
+                        t=t,
+                        img_path=frames[t],
+                        y=tools[t],
+                        phase_id=int(phase_ids[t]),
+                    )
+                )
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        s = self.samples[idx]
+        img = Image.open(s.img_path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+
+        y = torch.from_numpy(s.y)
+        phase_id = torch.tensor(s.phase_id)
+
+        npz = np.load(self.npz_path_map[s.vid], allow_pickle=False)
+        tfeat, tvalid = build_oracle_timefeat_from_npz(npz, s.t)
+        t_idx = torch.tensor(float(s.t), dtype=torch.float32)
+
+        return img, y, phase_id, tfeat, t_idx, tvalid
+
+
+# -------------------------
+# Model: image + timefeat
+# -------------------------
 class ResNet18ToolDetWithTimePred(nn.Module):
     def __init__(self, time_feat_dim: int, num_tools: int = 7, pretrained: bool = True, dropout: float = 0.2, time_emb_dim: int = 64):
         super().__init__()
@@ -207,10 +304,17 @@ def main():
     ap.add_argument("--stride", type=int, default=5)
     ap.add_argument("--out_json", type=str, default="eval_taskB.json")
 
-    ap.add_argument("--use_timepred", action="store_true")
-    ap.add_argument("--timepred_root", type=str, default="", help="dir with {split}/{vid}.pt")
-
+    # unified timed option
+    ap.add_argument(
+        "--time_source",
+        type=str,
+        default="none",
+        choices=["none", "pred", "oracle"],
+        help="none: baseline, pred: use saved timepreds, oracle: build GT time features from labels npz on-the-fly"
+    )
+    ap.add_argument("--timepred_root", type=str, default="", help="required if time_source=pred")
     ap.add_argument("--time_emb_dim", type=int, default=64)
+
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -225,25 +329,44 @@ def main():
     labels_dir = Path(args.labels_dir)
     split_json = Path(args.split_json)
 
-    if args.use_timepred:
+    use_time = (args.time_source != "none")
+    use_pred = (args.time_source == "pred")
+    use_oracle = (args.time_source == "oracle")
+
+    # dataset
+    if use_pred:
         if not args.timepred_root:
-            raise ValueError("--timepred_root is required when --use_timepred is set")
-
+            raise ValueError("--timepred_root is required when time_source=pred")
         preds = load_timepreds(Path(args.timepred_root), split_json, args.split)
-
         ds = Cholec80ToolDatasetWithTimePred(
             cholec80_dir, labels_dir, split_json, args.split,
             timepreds=preds, stride=args.stride, transform=tfm
         )
+    elif use_oracle:
+        # oracle IO 많음: 기본값 workers=4면 느리거나 문제가 날 수 있음.
+        # 필요하면 CLI로 --num_workers 0 줘.
+        ds = Cholec80ToolDatasetWithOracleTime(
+            cholec80_dir, labels_dir, split_json, args.split,
+            stride=args.stride, transform=tfm
+        )
     else:
         ds = Cholec80ToolDataset(cholec80_dir, labels_dir, split_json, args.split, stride=args.stride, transform=tfm)
 
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
+    dl = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+    )
 
-    if args.use_timepred:
+    # model
+    if use_time:
         sample = ds[0]
         time_feat_dim = int(sample[3].shape[-1])
-        model = ResNet18ToolDetWithTimePred(time_feat_dim=time_feat_dim, num_tools=7, pretrained=False, dropout=0.2, time_emb_dim=args.time_emb_dim)
+        model = ResNet18ToolDetWithTimePred(
+            time_feat_dim=time_feat_dim, num_tools=7, pretrained=False, dropout=0.2, time_emb_dim=args.time_emb_dim
+        )
     else:
         model = ResNet18ToolDet(num_tools=7, pretrained=False)
 
@@ -256,10 +379,12 @@ def main():
     all_logits, all_y, all_phase = [], [], []
     with torch.no_grad():
         for batch in dl:
-            if args.use_timepred:
-                x, y, phase_id, tfeat = batch
+            if use_time:
+                x, y, phase_id, tfeat, _, tvalid = batch
                 x = x.to(device, non_blocking=True)
                 tfeat = tfeat.to(device, non_blocking=True)
+                tvalid = tvalid.to(device, non_blocking=True).float().unsqueeze(1)  # (B,1)
+                tfeat = tfeat * tvalid
                 logits = model(x, tfeat).detach().cpu()
             else:
                 x, y, phase_id = batch
@@ -273,6 +398,7 @@ def main():
     logits = torch.cat(all_logits, dim=0).numpy()
     y = torch.cat(all_y, dim=0).numpy()
     phase = torch.cat(all_phase, dim=0).numpy()
+
     prob = 1 / (1 + np.exp(-logits))
     pred = (prob >= 0.5).astype(np.float32)
 
@@ -316,6 +442,7 @@ def main():
         "split": args.split,
         "stride": args.stride,
         "n_samples": int(len(ds)),
+        "time_source": args.time_source,
         "mAP(AUPRC_macro)": mAP,
         "AUPRC_micro": micro_auprc,
         "AP_per_tool": ap_per_tool,
