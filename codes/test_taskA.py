@@ -93,7 +93,10 @@ def eval_mae_seconds(
 def build_test_loader(args) -> DataLoader:
     label_dir = Path(args.label_dir)
     split = json.loads(Path(args.split_json).read_text())
-    test_vids = split["test"]
+    split_name = args.split
+    if split_name not in split:
+        raise KeyError(f"Split '{split_name}' not found in split_json. Available: {list(split.keys())}")
+    test_vids = split[split_name]
 
     if args.mode == "time_mlp":
         test_sets = [
@@ -187,7 +190,9 @@ def apply_mode_defaults(args) -> None:
         if args.seq_len is None:
             args.seq_len = 1
         if args.time_feat is None:
-            args.time_feat = "tnorm"
+            args.time_feat = "u"
+        if not args.pin_memory:
+            args.pin_memory = True
 
     elif args.mode == "time_lstm":
         if args.batch is None:
@@ -196,6 +201,8 @@ def apply_mode_defaults(args) -> None:
             args.seq_len = 180
         if args.time_feat is None:
             args.time_feat = "u_u2"
+        if not args.pin_memory:
+            args.pin_memory = True
 
     elif args.mode == "time_phase":
         if args.batch is None:
@@ -208,14 +215,17 @@ def apply_mode_defaults(args) -> None:
             args.use_phase_onehot = True
         if args.n_phases is None:
             args.n_phases = 7
+        args.pin_memory = False
 
     elif args.mode == "feat_lstm":
         if args.batch is None:
             args.batch = 64
         if args.seq_len is None:
-            args.seq_len = 120
+            args.seq_len = 60
         if args.time_feat is None:
-            args.time_feat = "tnorm"
+            args.time_feat = "u_u2_tnorm"
+        if not args.pin_memory:
+            args.pin_memory = True
 
     else:
         raise ValueError(args.mode)
@@ -228,6 +238,7 @@ def parse_args():
     ap.add_argument("--label_dir", type=str, required=True)
     ap.add_argument("--split_json", type=str, required=True)
     ap.add_argument("--feat_dir", type=str, default="", help="required for feat_lstm")
+    ap.add_argument("--split", type=str, default="test", choices=("train", "val", "test"))
 
     ap.add_argument("--batch", type=int, default=None)
     ap.add_argument("--num_workers", type=int, default=0)
@@ -263,6 +274,7 @@ def parse_args():
     ap.add_argument("--out_dir", type=str, default="./runs_taskA")
     ap.add_argument("--run_name", type=str, default="")
     ap.add_argument("--ckpt", type=str, default="")
+    ap.add_argument("--metrics_json", type=str, default="", help="write metrics to this path")
 
     return ap.parse_args()
 
@@ -293,7 +305,21 @@ def main():
     model.load_state_dict(ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt)
 
     scores = eval_mae_seconds(model, dl_test, device, args.mode)
-    print(f"[TEST] rt={scores[0]:.1f}s | bounds={scores[1]:.1f}s | total={scores[2]:.1f}s")
+    split_tag = args.split.upper()
+    print(f"[{split_tag}] rt={scores[0]:.1f}s | bounds={scores[1]:.1f}s | total={scores[2]:.1f}s")
+
+    if args.metrics_json:
+        metrics_path = Path(args.metrics_json)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "mode": args.mode,
+            "split": args.split,
+            "ckpt": str(ckpt_path),
+            "rt_mae_s": scores[0],
+            "bounds_mae_s": scores[1],
+            "total_mae_s": scores[2],
+        }
+        metrics_path.write_text(json.dumps(payload, indent=2))
 
 
 if __name__ == "__main__":

@@ -285,14 +285,15 @@ def build_model(args, sample_batch: Any) -> nn.Module:
     raise ValueError(args.mode)
 
 
-def save_ckpt(path: Path, model: nn.Module, opt: torch.optim.Optimizer, epoch: int, best_rt: float):
+def save_ckpt(path: Path, model: nn.Module, opt: torch.optim.Optimizer, epoch: int, best_total: float):
+
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
             "model": model.state_dict(),
             "optimizer": opt.state_dict(),
             "epoch": epoch,
-            "best_rt": best_rt,
+            "best_total" : best_total
         },
         path,
     )
@@ -304,14 +305,15 @@ def load_ckpt(path: Path, model: nn.Module, opt: torch.optim.Optimizer, device: 
     if "optimizer" in ckpt and opt is not None:
         opt.load_state_dict(ckpt["optimizer"])
     start_epoch = int(ckpt.get("epoch", 0)) + 1
-    best_rt = float(ckpt.get("best_rt", float("inf")))
-    return start_epoch, best_rt
+    best_total = float(ckpt.get("best_total", float("inf")))
+
+    return start_epoch, best_total
 
 
 def apply_mode_defaults(args) -> None:
     if args.mode == "time_mlp":
         if args.epochs is None:
-            args.epochs = 20
+            args.epochs = 50
         if args.batch is None:
             args.batch = 512
         if args.batch_val is None:
@@ -331,7 +333,7 @@ def apply_mode_defaults(args) -> None:
 
     elif args.mode == "time_lstm":
         if args.epochs is None:
-            args.epochs = 20
+            args.epochs = 50
         if args.batch is None:
             args.batch = 256
         if args.batch_val is None:
@@ -351,7 +353,7 @@ def apply_mode_defaults(args) -> None:
 
     elif args.mode == "time_phase":
         if args.epochs is None:
-            args.epochs = 20
+            args.epochs = 50
         if args.batch is None:
             args.batch = 256
         if args.batch_val is None:
@@ -388,7 +390,7 @@ def apply_mode_defaults(args) -> None:
         if args.seq_len is None:
             args.seq_len = 60
         if args.time_feat is None:
-            args.time_feat = "tnorm"
+            args.time_feat = "u_u2_tnorm"
         if args.dropout == 0.2:
             args.dropout = 0.4
         if args.early_stop_patience is None:
@@ -499,19 +501,20 @@ def main():
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=4)
 
     start_epoch = 1
-    best_rt = float("inf")
+    #best_rt = float("inf")
+    best_total = float("inf")
 
     # resume
     if args.resume:
-        start_epoch, best_rt = load_ckpt(Path(args.resume), model, opt, device)
-        print(f"=> resumed from {args.resume} start_epoch={start_epoch} best_rt={best_rt:.3f}")
+        start_epoch, best_total = load_ckpt(Path(args.resume), model, opt, device)
+        print(f"=> resumed from {args.resume} start_epoch={start_epoch} best_total={best_total:.3f}")
 
     # eval-only
     if args.eval_only:
         if not args.resume and not best_ckpt.exists():
             raise RuntimeError("eval_only requires --resume or an existing best.pt in run dir")
         if not args.resume:
-            start_epoch, best_rt = load_ckpt(best_ckpt, model, opt=None, device=device)  # type: ignore
+            start_epoch, best_total = load_ckpt(best_ckpt, model, opt=None, device=device)  # type: ignore
         scores = eval_mae_seconds(model, dl_val, device, args.mode)
         print(f"[VAL] rt={scores[0]:.1f}s | bounds={scores[1]:.1f}s | total={scores[2]:.1f}s")
 
@@ -526,7 +529,7 @@ def main():
         rt_mae, bounds_mae, total_mae = eval_mae_seconds(model, dl_val, device, args.mode)
 
         if sched is not None:
-            sched.step(rt_mae)
+            sched.step(total_mae)
 
         dt = time.time() - t0
         lr = opt.param_groups[0]["lr"]
@@ -538,15 +541,13 @@ def main():
         )
 
         # save last
-        save_ckpt(last_ckpt, model, opt, epoch, best_rt)
+        save_ckpt(last_ckpt, model, opt, epoch, best_total)
 
-        # save best (by RT MAE)
-        improved = rt_mae < best_rt
+        improved = total_mae < best_total
         if improved:
-            best_rt = rt_mae
-            save_ckpt(best_ckpt, model, opt, epoch, best_rt)
-            print("  saved best:", best_ckpt)
-
+            best_total = total_mae
+            save_ckpt(best_ckpt, model, opt, epoch, best_total)
+            print("  saved best (by total MAE):", best_ckpt)
         # early stop
         if args.early_stop_patience is not None:
             if improved:
