@@ -26,9 +26,6 @@ def build_oracle_timefeat_from_npz(npz: np.lib.npyio.NpzFile, t: int) -> tuple[t
     rt = npz["rt_current"].astype(np.float32)
     rt_t = float(rt[t] if rt.ndim == 1 else rt[t, 0])
 
-    rt_t = np.log1p(rt_t)
-    b = np.log1p(np.maximum(b, 0.0))
-
     bounds = npz["bounds_rem"].astype(np.float32)          # (T,7,2) or (T,14)
     if bounds.ndim == 3:
         b = bounds[t].reshape(-1)                          # (14,)
