@@ -393,8 +393,6 @@ def apply_mode_defaults(args) -> None:
             args.time_feat = "u_u2_tnorm"
         if args.dropout == 0.2:
             args.dropout = 0.4
-        if args.early_stop_patience is None:
-            args.early_stop_patience = 5
 
     else:
         raise ValueError(args.mode)
