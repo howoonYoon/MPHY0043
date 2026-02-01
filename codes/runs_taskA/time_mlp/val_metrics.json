@@ -1,0 +1,8 @@
+{
+  "mode": "time_mlp",
+  "split": "val",
+  "ckpt": "/myriadfs/home/rmaphyo/Scratch/surgery_time_project/runs_taskA/time_mlp/best.pt",
+  "rt_mae_s": 366.3846130371094,
+  "bounds_mae_s": 496.48486328125,
+  "total_mae_s": 480.1507873535156
+}

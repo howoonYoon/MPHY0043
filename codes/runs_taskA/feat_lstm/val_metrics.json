@@ -1,0 +1,8 @@
+{
+  "mode": "feat_lstm",
+  "split": "val",
+  "ckpt": "/myriadfs/home/rmaphyo/Scratch/surgery_time_project/runs_taskA/feat_lstm/best.pt",
+  "rt_mae_s": 291.3976745605469,
+  "bounds_mae_s": 268.3733825683594,
+  "total_mae_s": 271.3011474609375
+}

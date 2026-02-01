@@ -1,0 +1,8 @@
+{
+  "mode": "time_lstm",
+  "split": "val",
+  "ckpt": "/myriadfs/home/rmaphyo/Scratch/surgery_time_project/runs_taskA/time_lstm/last.pt",
+  "rt_mae_s": 431.69158935546875,
+  "bounds_mae_s": 329.1111145019531,
+  "total_mae_s": 341.9900817871094
+}

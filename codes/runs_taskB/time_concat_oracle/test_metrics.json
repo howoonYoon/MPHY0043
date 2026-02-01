@@ -1,0 +1,111 @@
+{
+  "split": "test",
+  "stride": 1,
+  "n_samples": 21562,
+  "time_source": "oracle",
+  "mAP(AUPRC_macro)": 0.6527387563136556,
+  "AUPRC_micro": 0.7706606483306563,
+  "AP_per_tool": {
+    "Grasper": 0.7911974130219973,
+    "Bipolar": 0.5249721701888963,
+    "Hook": 0.944153461885468,
+    "Scissors": 0.3992086221863797,
+    "Clipper": 0.6101032286531543,
+    "Irrigator": 0.3742688587155787,
+    "SpecimenBag": 0.9252675395441154
+  },
+  "macro_f1@0.5": 0.5401228070259094,
+  "phasewise": {
+    "Preparation": {
+      "n_samples": 840,
+      "mAP(AUPRC_macro)": 0.5836044843876751,
+      "AP_per_tool": {
+        "Grasper": 0.9110971537096972,
+        "Bipolar": NaN,
+        "Hook": 0.25611181506565284,
+        "Scissors": NaN,
+        "Clipper": NaN,
+        "Irrigator": NaN,
+        "SpecimenBag": NaN
+      }
+    },
+    "CalotTriangleDissection": {
+      "n_samples": 8360,
+      "mAP(AUPRC_macro)": 0.4191486983141896,
+      "AP_per_tool": {
+        "Grasper": 0.8177118367231508,
+        "Bipolar": 0.22730541364011883,
+        "Hook": 0.9524565484022695,
+        "Scissors": NaN,
+        "Clipper": 0.00697417607224338,
+        "Irrigator": 0.09129551673316526,
+        "SpecimenBag": NaN
+      }
+    },
+    "ClippingCutting": {
+      "n_samples": 1391,
+      "mAP(AUPRC_macro)": 0.38367441808913677,
+      "AP_per_tool": {
+        "Grasper": 0.3554807027778438,
+        "Bipolar": NaN,
+        "Hook": 0.39854319763683754,
+        "Scissors": 0.4499863677154888,
+        "Clipper": 0.6574707984489472,
+        "Irrigator": 0.05689102386656647,
+        "SpecimenBag": NaN
+      }
+    },
+    "GallbladderDissection": {
+      "n_samples": 7731,
+      "mAP(AUPRC_macro)": 0.5758479563498878,
+      "AP_per_tool": {
+        "Grasper": 0.7677188179795031,
+        "Bipolar": 0.3628343657868925,
+        "Hook": 0.9465461476760934,
+        "Scissors": NaN,
+        "Clipper": NaN,
+        "Irrigator": 0.22629249395706214,
+        "SpecimenBag": NaN
+      }
+    },
+    "GallbladderRetraction": {
+      "n_samples": 802,
+      "mAP(AUPRC_macro)": 0.5018216846867485,
+      "AP_per_tool": {
+        "Grasper": 0.6825483688700811,
+        "Bipolar": 0.06172156470773441,
+        "Hook": NaN,
+        "Scissors": NaN,
+        "Clipper": NaN,
+        "Irrigator": 0.6057420418111379,
+        "SpecimenBag": 0.6572747633580406
+      }
+    },
+    "CleaningCoagulation": {
+      "n_samples": 1437,
+      "mAP(AUPRC_macro)": 0.6134882764542342,
+      "AP_per_tool": {
+        "Grasper": 0.8453910162958476,
+        "Bipolar": 0.7490604117599695,
+        "Hook": NaN,
+        "Scissors": 0.010991791691693432,
+        "Clipper": NaN,
+        "Irrigator": 0.6471133467792938,
+        "SpecimenBag": 0.8148848157443663
+      }
+    },
+    "GallbladderPackaging": {
+      "n_samples": 1001,
+      "mAP(AUPRC_macro)": 0.9827118073509887,
+      "AP_per_tool": {
+        "Grasper": 0.9745681438879745,
+        "Bipolar": NaN,
+        "Hook": NaN,
+        "Scissors": NaN,
+        "Clipper": NaN,
+        "Irrigator": NaN,
+        "SpecimenBag": 0.9908554708140029
+      }
+    }
+  }
+}
