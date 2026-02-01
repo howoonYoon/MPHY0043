@@ -1,4 +1,37 @@
 #!/usr/bin/env python3
+"""
+Cholec80 -> Task A/B label generation (25fps annotations -> 1fps aligned NPZ).
+
+This script:
+1) Reads Cholec80 phase annotations (per-frame at ~25fps) and downsamples to 1fps.
+2) Reads Cholec80 tool annotations (sparse rows at 0,25,50,... frames),
+   forward-fills to dense 25fps, then downsamples to 1fps.
+3) Builds Task A regression targets at 1fps using phase runs:
+   - rt_current: remaining time until the end of the current phase
+   - bounds_rem: for each phase p, remaining time until the next start/end of phase p
+   - mask_bounds: validity mask for bounds_rem
+   - elapsed_phase: elapsed time since current phase start
+4) Saves per-video NPZ files and a default train/val/test split JSON.
+
+Directory layout expected under --cholec80_dir
+----------------------------------------------
+- frames/videoXX/*.png
+- phase_annotations/videoXX-phase.txt
+- tool_annotations/videoXX-tool.txt
+
+Outputs under --out_dir
+-----------------------
+- videoXX_labels.npz : main labels for training/evaluation
+- videoXX_meta.json  : lightweight debug metadata
+- split_default_60_10_10.json : simple default split (by video number)
+
+Notes
+-----
+- All 1fps indices correspond to seconds.
+- Downsampling is done by selecting frame index 25*t (or 25*t+12 if --center_sample).
+- Times are stored in seconds (float32). Masks are 0/1 float32.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -27,13 +60,27 @@ ID2PHASE = {v: k for k, v in PHASE2ID.items()}
 
 TOOL_COLS = ["Grasper", "Bipolar", "Hook", "Scissors", "Clipper", "Irrigator", "SpecimenBag"]
 NUM_PHASES = 7
-FPS_RATIO = 25  # original video 25fps -> released frames 1fps (one frame per second)
+FPS_RATIO = 25  # original annotations at 25fps -> use 1fps (1 sample per second)
 
 
 def runs_from_labels(labels: np.ndarray) -> list[tuple[int, int, int]]:
     """
-    Convert label sequence into runs.
-    Returns list of (phase_id, start_idx, end_idx) inclusive.
+    Convert an integer label sequence into contiguous runs.
+
+    Parameters
+    ----------
+    labels:
+        1D array of integer labels of length T (e.g., phase_id per 1fps frame).
+
+    Returns
+    -------
+    runs:
+        List of (label_id, start_idx, end_idx) for each contiguous segment.
+        Indices are inclusive.
+
+    Example
+    -------
+    labels = [0,0,0,1,1,2] -> [(0,0,2), (1,3,4), (2,5,5)]
     """
     labels = np.asarray(labels).astype(int)
     T = len(labels)
@@ -51,6 +98,21 @@ def runs_from_labels(labels: np.ndarray) -> list[tuple[int, int, int]]:
 # Utilities
 # -------------------------
 def one_hot(x: int, K: int) -> np.ndarray:
+    """
+    Create a one-hot vector.
+
+    Parameters
+    ----------
+    x:
+        Index to set to 1.
+    K:
+        Number of classes.
+
+    Returns
+    -------
+    v:
+        (K,) float32 one-hot vector. All zeros if x is out of range.
+    """
     v = np.zeros((K,), dtype=np.float32)
     if 0 <= x < K:
         v[x] = 1.0
@@ -58,26 +120,56 @@ def one_hot(x: int, K: int) -> np.ndarray:
 
 
 def count_png_frames(frames_dir: Path) -> int:
+    """
+    Count the number of PNG frames in a directory.
+
+    Parameters
+    ----------
+    frames_dir:
+        Directory containing extracted 1fps frames (*.png).
+
+    Returns
+    -------
+    n:
+        Number of PNG files.
+    """
     return len(list(frames_dir.glob("*.png")))
 
 
 def load_phase_25fps(phase_txt: Path) -> np.ndarray:
     """
-    Loads per-frame phase at original fps indexing (typically 25fps).
-    Returns phase_ids_25 of shape (F_25,), where index corresponds to original frame.
+    Load per-frame phase labels at the original indexing (typically 25fps).
+
+    The Cholec80 phase annotation file is a TSV with at least:
+      - "Frame" : frame index
+      - "Phase" : phase name string
+
+    Parameters
+    ----------
+    phase_txt:
+        Path to videoXX-phase.txt.
+
+    Returns
+    -------
+    phase_ids_25:
+        1D int64 array of length F_25 (frame-indexed) containing phase IDs.
+
+    Notes
+    -----
+    If the Frame column is not perfectly contiguous, this function rebuilds a
+    dense array and forward-fills any gaps.
     """
     df = pd.read_csv(phase_txt, sep="\t").sort_values("Frame").reset_index(drop=True)
 
-    # Frame column should be 0..Fmax contiguous in typical Cholec80 exports
     frames = df["Frame"].to_numpy()
     if frames[0] != 0 or not np.all(frames == np.arange(len(frames))):
-        # If not contiguous, we still can rebuild full array by reindexing
         Fmax = int(frames.max())
         phase_ids_25 = np.zeros((Fmax + 1,), dtype=np.int64)
         phase_ids_25[:] = -1
         mapped = df["Phase"].map(PHASE2ID).to_numpy(dtype=np.int64)
         phase_ids_25[frames.astype(int)] = mapped
-        # forward-fill any gaps (rare)
+
+        # Forward-fill gaps (rare)
         last = phase_ids_25[0] if phase_ids_25[0] != -1 else 0
         for i in range(len(phase_ids_25)):
             if phase_ids_25[i] == -1:
@@ -92,10 +184,24 @@ def load_phase_25fps(phase_txt: Path) -> np.ndarray:
 
 def load_tools_sparse_25fps(tool_txt: Path) -> Tuple[np.ndarray, np.ndarray]:
     """
-    tool file often contains rows at frames 0,25,50,... with binary columns.
-    Returns:
-      frames_sparse: (M,) int
-      tools_sparse:  (M,7) float32
+    Load sparse tool annotations.
+
+    Cholec80 tool annotation files often provide rows only at 1fps positions
+    in the original 25fps frame space (e.g., frames 0, 25, 50, ...), with
+    binary tool presence columns.
+
+    Parameters
+    ----------
+    tool_txt:
+        Path to videoXX-tool.txt.
+
+    Returns
+    -------
+    frames_sparse:
+        (M,) int64 frame indices in 25fps space.
+    tools_sparse:
+        (M,7) float32 tool indicators aligned to frames_sparse.
+        Column order is TOOL_COLS.
     """
     df = pd.read_csv(tool_txt, sep="\t").sort_values("Frame").reset_index(drop=True)
     frames_sparse = df["Frame"].to_numpy(dtype=np.int64)
@@ -105,10 +211,22 @@ def load_tools_sparse_25fps(tool_txt: Path) -> Tuple[np.ndarray, np.ndarray]:
 
 def expand_sparse_to_dense(frames_sparse: np.ndarray, values_sparse: np.ndarray, Fmax: int) -> np.ndarray:
     """
-    Forward-fill sparse annotations to length (Fmax+1).
-    frames_sparse: (M,), increasing
-    values_sparse: (M,D)
-    Returns dense: (Fmax+1, D)
+    Expand sparse per-frame annotations into a dense sequence by forward-fill.
+
+    Parameters
+    ----------
+    frames_sparse:
+        (M,) increasing integer frame indices where new values are provided.
+    values_sparse:
+        (M,D) values at those frames (e.g., tool presence).
+    Fmax:
+        Last frame index (inclusive) of the dense output.
+
+    Returns
+    -------
+    dense:
+        (Fmax+1, D) dense array where values are forward-filled from the most
+        recent sparse row.
     """
     D = values_sparse.shape[1]
     dense = np.zeros((Fmax + 1, D), dtype=np.float32)
@@ -125,9 +243,27 @@ def expand_sparse_to_dense(frames_sparse: np.ndarray, values_sparse: np.ndarray,
 
 def downsample_25fps_to_1fps(arr_25: np.ndarray, T_1: int, fps_ratio: int = FPS_RATIO, center: bool = False) -> np.ndarray:
     """
-    Downsample by picking one sample per second.
-    If center=True, picks 25*t + 12 (mid-frame) instead of 25*t.
-    Works for 1D (F,) or 2D (F,D).
+    Downsample a 25fps-aligned sequence to 1fps by indexing.
+
+    Parameters
+    ----------
+    arr_25:
+        Array in 25fps indexing. Shape (F,) or (F,D).
+    T_1:
+        Number of 1fps frames (seconds) to produce.
+    fps_ratio:
+        Frames per second in the original annotation indexing (default 25).
+    center:
+        If True, pick the mid-frame 25*t + 12 instead of 25*t.
+
+    Returns
+    -------
+    arr_1:
+        Downsampled array of shape (T_1,) or (T_1,D), aligned to 1fps.
+
+    Notes
+    -----
+    Indices are clipped to the valid range of arr_25.
     """
     if center:
         idx = (np.arange(T_1) * fps_ratio + (fps_ratio // 2)).astype(np.int64)
@@ -142,12 +278,30 @@ def downsample_25fps_to_1fps(arr_25: np.ndarray, T_1: int, fps_ratio: int = FPS_
 # -------------------------
 @dataclass(frozen=True)
 class PhaseSegment:
+    """
+    Simple inclusive phase segment in 1fps indexing.
+    """
     phase: int
     start: int  # inclusive 1fps index
     end: int    # inclusive 1fps index
 
 
 def extract_phase_segments_1fps(phase_ids_1: np.ndarray, num_phases: int = NUM_PHASES) -> Dict[int, PhaseSegment]:
+    """
+    Extract (start,end) segment per phase by scanning a 1fps phase-id sequence.
+
+    Parameters
+    ----------
+    phase_ids_1:
+        (T,) 1fps phase id array.
+    num_phases:
+        Number of phases.
+
+    Returns
+    -------
+    segs:
+        Dict mapping phase_id -> PhaseSegment(start,end) for phases that appear.
+    """
     phase_ids_1 = np.asarray(phase_ids_1).astype(int)
     segs: Dict[int, PhaseSegment] = {}
     for p in range(num_phases):
@@ -157,23 +311,58 @@ def extract_phase_segments_1fps(phase_ids_1: np.ndarray, num_phases: int = NUM_P
         segs[p] = PhaseSegment(phase=p, start=int(idx.min()), end=int(idx.max()))
     return segs
 
+
 def build_taskA_for_video_1fps(
     phase_ids_1: np.ndarray,
     num_phases: int = NUM_PHASES,
     clamp_nonnegative: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
-    All times are in seconds because 1fps index == seconds index.
-    Outputs:
-      X: (T, 9) = phase onehot(7) + elapsed_surgery + elapsed_phase
-      # NOTE:
-        # X is stored for optional analysis / ablation.
-        # In the main Task A experiments, phase one-hot is NOT used as model input.
+    Build Task A targets at 1fps given per-frame phase ids.
 
-      rt_current: (T,1)
-      bounds_rem: (T,7,2) where [:,p,0]=start_p - t, [:,p,1]=end_p - t (future run)
-      mask_bounds: (T,7,2) valid mask
-      elapsed_phase: (T,1)
+    All times are in seconds because 1fps index == seconds index.
+
+    Definitions
+    -----------
+    Let t be the current time index (seconds). Let the current phase run be
+    [cur_start[t], cur_end[t]] inclusive.
+
+    - rt_current[t] = cur_end[t] - t
+      Remaining time until the end of the current phase.
+
+    For each phase p, define the "next run" of phase p that starts at/after time t
+    (including the current run if phase_ids_1[t] == p). If such a run exists:
+      - bounds_rem[t,p,0] = start_p - t  (remaining time until start of phase p)
+      - bounds_rem[t,p,1] = end_p - t    (remaining time until end of phase p)
+      - mask_bounds[t,p,:] = 1
+    Otherwise mask_bounds is 0 for that phase at time t.
+
+    Additional signals
+    ------------------
+    - elapsed_phase[t] = t - cur_start[t]
+    - X[t] = [phase_onehot(7), elapsed_surgery=t, elapsed_phase]
+
+    Parameters
+    ----------
+    phase_ids_1:
+        (T,) phase ID per 1fps frame.
+    num_phases:
+        Number of phases (default 7 for Cholec80).
+    clamp_nonnegative:
+        If True, clip rt_current and bounds_rem to be >= 0.
+
+    Returns
+    -------
+    payload:
+        Dictionary of numpy arrays to be saved into NPZ:
+          - X               : (T, num_phases+2)
+          - phase_ids_1fps   : (T,)
+          - rt_current       : (T,1)
+          - bounds_rem       : (T,num_phases,2)
+          - mask_bounds      : (T,num_phases,2)
+          - elapsed_phase    : (T,1)
+          - cur_start_1fps   : (T,) (debug)
+          - cur_end_1fps     : (T,) (debug)
     """
     phase_ids_1 = np.asarray(phase_ids_1).astype(int)
     T = len(phase_ids_1)
@@ -181,39 +370,36 @@ def build_taskA_for_video_1fps(
 
     runs = runs_from_labels(phase_ids_1)
 
-    # per-time current run start/end
+    # Current run start/end for each time t
     cur_start = np.zeros((T,), dtype=np.int64)
     cur_end = np.zeros((T,), dtype=np.int64)
     for p, s, e in runs:
-        cur_start[s:e+1] = s
-        cur_end[s:e+1] = e
+        cur_start[s:e + 1] = s
+        cur_end[s:e + 1] = e
 
-    # inputs
+    # Input-like signals (stored mainly for analysis/ablation)
     X = np.zeros((T, num_phases + 2), dtype=np.float32)
-    X[:, num_phases:num_phases+1] = t_sec.reshape(-1, 1)  # elapsed_surgery
+    X[:, num_phases:num_phases + 1] = t_sec.reshape(-1, 1)  # elapsed_surgery
 
-    # targets
+    # Targets
     rt_current = (cur_end.astype(np.float32) - t_sec).reshape(-1, 1)
     elapsed_phase = (t_sec - cur_start.astype(np.float32)).reshape(-1, 1)
-    X[:, num_phases+1:num_phases+2] = elapsed_phase
+    X[:, num_phases + 1:num_phases + 2] = elapsed_phase
 
-    # phase onehot
+    # Phase one-hot
     for t in range(T):
         p = int(phase_ids_1[t])
         X[t, :num_phases] = one_hot(p, num_phases)
 
-    # upcoming phase bounds: "the next run of phase p that starts at/after t"
+    # Find next occurrence of each phase by scanning runs from back to front
     next_start = np.full((T, num_phases), np.nan, dtype=np.float32)
     next_end = np.full((T, num_phases), np.nan, dtype=np.float32)
 
-    # Fill next occurrence by scanning runs from back to front
-    # Maintain latest run (start,end) seen in the future for each phase.
     future_s = np.full((num_phases,), np.nan, dtype=np.float32)
     future_e = np.full((num_phases,), np.nan, dtype=np.float32)
 
     run_idx = len(runs) - 1
     for t in range(T - 1, -1, -1):
-        # update future pointers when passing run boundaries
         while run_idx >= 0 and runs[run_idx][1] == t:
             p, s, e = runs[run_idx]
             future_s[p] = float(s)
@@ -225,7 +411,6 @@ def build_taskA_for_video_1fps(
     bounds_rem = np.zeros((T, num_phases, 2), dtype=np.float32)
     mask_bounds = np.zeros((T, num_phases, 2), dtype=np.float32)
 
-    # Compute remaining-to-start/end; valid when next_start is not nan AND next_start >= t
     for p in range(num_phases):
         s = next_start[:, p]
         e = next_end[:, p]
@@ -239,14 +424,14 @@ def build_taskA_for_video_1fps(
         bounds_rem = np.maximum(bounds_rem, 0.0)
 
     return {
-        "X": X,  # (T,9)
-        "phase_ids_1fps": phase_ids_1.astype(np.int64),  # (T,)
-        "rt_current": rt_current.astype(np.float32),  # (T,1)
-        "bounds_rem": bounds_rem.astype(np.float32),  # (T,7,2)
-        "mask_bounds": mask_bounds.astype(np.float32),  # (T,7,2)
-        "elapsed_phase": elapsed_phase.astype(np.float32),  # (T,1)
-        "cur_start_1fps": cur_start.astype(np.int64),  # optional debug
-        "cur_end_1fps": cur_end.astype(np.int64),      # optional debug
+        "X": X,
+        "phase_ids_1fps": phase_ids_1.astype(np.int64),
+        "rt_current": rt_current.astype(np.float32),
+        "bounds_rem": bounds_rem.astype(np.float32),
+        "mask_bounds": mask_bounds.astype(np.float32),
+        "elapsed_phase": elapsed_phase.astype(np.float32),
+        "cur_start_1fps": cur_start.astype(np.int64),
+        "cur_end_1fps": cur_end.astype(np.int64),
     }
 
 
@@ -255,7 +440,18 @@ def build_taskA_for_video_1fps(
 # -------------------------
 def process_video(cholec80_dir: Path, video_num: int, out_dir: Path, center_sample: bool = False) -> None:
     """
-    video_num: 1..80 corresponds to folder names video01..video80
+    Process one Cholec80 video and write an NPZ label file.
+
+    Parameters
+    ----------
+    cholec80_dir:
+        Root directory containing frames/, phase_annotations/, tool_annotations/.
+    video_num:
+        Integer 1..80 corresponding to folder name video01..video80.
+    out_dir:
+        Output directory where labels NPZ and meta JSON will be written.
+    center_sample:
+        If True, use mid-frame (25*t+12) instead of 25*t when downsampling 25fps->1fps.
     """
     vid_name = f"video{video_num:02d}"
     phase_txt = cholec80_dir / "phase_annotations" / f"{vid_name}-phase.txt"
@@ -277,7 +473,7 @@ def process_video(cholec80_dir: Path, video_num: int, out_dir: Path, center_samp
     phase_25 = load_phase_25fps(phase_txt)
     phase_1 = downsample_25fps_to_1fps(phase_25, T_1, fps_ratio=FPS_RATIO, center=center_sample)
 
-    # Tools: sparse 25fps rows -> dense -> 1fps
+    # Tools: sparse rows -> dense 25fps -> 1fps
     frames_sparse, tools_sparse = load_tools_sparse_25fps(tool_txt)
     Fmax = int(max(frames_sparse.max(), len(phase_25) - 1))
     tools_25_dense = expand_sparse_to_dense(frames_sparse, tools_sparse, Fmax=Fmax)
@@ -286,7 +482,7 @@ def process_video(cholec80_dir: Path, video_num: int, out_dir: Path, center_samp
     # Task A labels from 1fps phase ids
     taskA = build_taskA_for_video_1fps(phase_1)
 
-    # Save
+    # Save NPZ
     out_dir.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         out_dir / f"{vid_name}_labels.npz",
@@ -309,14 +505,27 @@ def process_video(cholec80_dir: Path, video_num: int, out_dir: Path, center_samp
 
 
 def main():
+    """
+    CLI entry point.
+
+    Iterates through videos [video_start, video_end], generates per-video NPZ labels,
+    then writes a simple default split JSON (60/10/10 by video number).
+    """
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cholec80_dir", type=str, required=True,
-                    help="Path to cholec80 directory (contains frames/, phase_annotations/, tool_annotations/)")
+    ap.add_argument(
+        "--cholec80_dir",
+        type=str,
+        required=True,
+        help="Path to cholec80 directory (contains frames/, phase_annotations/, tool_annotations/)",
+    )
     ap.add_argument("--out_dir", type=str, required=True, help="Where to write *.npz label files")
     ap.add_argument("--video_start", type=int, default=1, help="Start video number (1..80)")
     ap.add_argument("--video_end", type=int, default=80, help="End video number (1..80)")
-    ap.add_argument("--center_sample", action="store_true",
-                    help="Use mid-frame (25*t+12) instead of 25*t for downsampling")
+    ap.add_argument(
+        "--center_sample",
+        action="store_true",
+        help="Use mid-frame (25*t+12) instead of 25*t for downsampling",
+    )
     args = ap.parse_args()
 
     cholec80_dir = Path(args.cholec80_dir)
@@ -334,7 +543,6 @@ def main():
     }
     (out_dir / "split_default_60_10_10.json").write_text(json.dumps(split, indent=2))
     print("Done. Wrote split_default_60_10_10.json")
-
 
 
 if __name__ == "__main__":
